@@ -1,0 +1,163 @@
+from typing import Any, cast
+from boa3.builtin.compile_time import public, NeoMetadata
+from boa3.builtin.interop import runtime, storage
+from boa3.builtin.interop.blockchain import Transaction
+from boa3.builtin.type import UInt160
+from boa3.builtin.contract import Nep17TransferEvent, abort
+from boa3.builtin.interop.contract import call_contract
+from boa3.builtin.interop.neo import NeoToken, GasToken
+
+# ==================== TOKEN SETTINGS ====================
+TOKEN_SYMBOL = 'RNST'
+TOKEN_DECIMALS = 8
+TOKEN_TOTAL_SUPPLY = 100_000_000 * 10 ** TOKEN_DECIMALS
+
+# ==================== STAKING SETTINGS ====================
+STAKED_PREFIX = b'staked_'
+LAST_CLAIM_PREFIX = b'lastclaim_'
+REWARD_RATE_KEY = b'rewardrate'
+TOTAL_STAKED_KEY = b'totalstaked'
+VAULT_OWNER_KEY = b'owner'
+
+DEFAULT_REWARD_RATE = 10  # 0.1% per day (≈36.5% APY)
+
+# ==================== EVENTS ====================
+on_transfer = Nep17TransferEvent
+
+# ==================== HELPER FUNCTIONS ====================
+def get_staked(account: UInt160) -> int:
+    return storage.get_int(STAKED_PREFIX + account)
+
+def get_last_claim(account: UInt160) -> int:
+    return storage.get_int(LAST_CLAIM_PREFIX + account)
+
+def get_reward_rate() -> int:
+    rate = storage.get_int(REWARD_RATE_KEY)
+    return rate if rate > 0 else DEFAULT_REWARD_RATE
+
+def get_total_staked() -> int:
+    return storage.get_int(TOTAL_STAKED_KEY)
+
+def get_owner() -> UInt160:
+    return storage.get_uint160(VAULT_OWNER_KEY)
+
+# ==================== NEP-17 STANDARD ====================
+@public(safe=True)
+def symbol() -> str:
+    return TOKEN_SYMBOL
+
+@public(safe=True)
+def decimals() -> int:
+    return TOKEN_DECIMALS
+
+@public(name='totalSupply', safe=True)
+def total_supply() -> int:
+    return storage.get_int(b'totalSupply')
+
+@public(name='balanceOf', safe=True)
+def balance_of(account: UInt160) -> int:
+    return storage.get_int(account)
+
+@public
+def transfer(from_address: UInt160, to_address: UInt160, amount: int, data: Any) -> bool:
+    if len(from_address) != 20 or len(to_address) != 20 or amount < 0:
+        return False
+
+    from_balance = balance_of(from_address)
+    if from_balance < amount:
+        return False
+
+    if from_address != runtime.executing_script_hash and not runtime.check_witness(from_address):
+        return False
+
+    if from_address != to_address and amount != 0:
+        storage.put_int(from_address, from_balance - amount)
+        storage.put_int(to_address, balance_of(to_address) + amount)
+
+    Nep17TransferEvent(from_address, to_address, amount)
+
+    # Transferring tokens TO the contract = STAKE into the vault
+    if to_address == runtime.executing_script_hash:
+        do_stake(from_address, amount)
+
+    return True
+
+@public
+def onNEP17Payment(from_address: UInt160, amount: int, data: Any):
+    if runtime.calling_script_hash == runtime.executing_script_hash:
+        do_stake(from_address, amount)
+
+def do_stake(account: UInt160, amount: int):
+    if amount == 0:
+        return
+    staked = get_staked(account)
+    storage.put_int(STAKED_PREFIX + account, staked + amount)
+    storage.put_int(TOTAL_STAKED_KEY, get_total_staked() + amount)
+
+    if get_last_claim(account) == 0:
+        storage.put_int(LAST_CLAIM_PREFIX + account, runtime.get_time())
+
+# ==================== VAULT FUNCTIONS ====================
+@public
+def claim(account: UInt160) -> int:
+    if not runtime.check_witness(account):
+        return 0
+    staked = get_staked(account)
+    if staked == 0:
+        return 0
+
+    last = get_last_claim(account)
+    now = runtime.get_time()
+    seconds = now - last if now > last else 0
+    rewards = (seconds * get_reward_rate() * staked) // (86400 * 10000)
+
+    if rewards > 0:
+        # Mint rewards to user
+        storage.put_int(account, balance_of(account) + rewards)
+        storage.put_int(LAST_CLAIM_PREFIX + account, now)
+    return rewards
+
+@public
+def unstake(account: UInt160, amount: int):
+    if not runtime.check_witness(account):
+        return
+    staked = get_staked(account)
+    if staked < amount or amount <= 0:
+        return
+
+    storage.put_int(STAKED_PREFIX + account, staked - amount)
+    storage.put_int(TOTAL_STAKED_KEY, get_total_staked() - amount)
+
+    # Contract sends tokens back
+    transfer(runtime.executing_script_hash, account, amount, None)
+
+@public
+def set_reward_rate(new_rate: int):
+    if not runtime.check_witness(get_owner()):
+        return
+    storage.put_int(REWARD_RATE_KEY, new_rate)
+
+# ==================== DEPLOY ====================
+@public
+def _deploy(data: Any, update: bool):
+    if not update:
+        container: Transaction = runtime.script_container
+        storage.put_int(b'totalSupply', TOKEN_TOTAL_SUPPLY)
+        storage.put_uint160(VAULT_OWNER_KEY, container.sender)
+        storage.put_int(REWARD_RATE_KEY, DEFAULT_REWARD_RATE)
+        storage.put_int(container.sender, TOKEN_TOTAL_SUPPLY)
+        Nep17TransferEvent(None, container.sender, TOKEN_TOTAL_SUPPLY)
+
+@public
+def verify() -> bool:
+    return runtime.check_witness(get_owner())
+
+# ==================== METADATA ====================
+@public
+def manifest_metadata() -> NeoMetadata:
+    meta = NeoMetadata()
+    meta.name = "RodesNeoStakingToken"
+    meta.supported_standards = ['NEP-17']
+    meta.author = "Crypto Neoboy (@Rodes_Neo) - FrankCoin Core Team"
+    meta.description = "RNST - Easy Staking Token with Automatic Daily Rewards (Neo Smart Savings Vault Phase 1)"
+    return meta
